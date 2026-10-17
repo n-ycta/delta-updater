@@ -30,6 +30,7 @@ export const defaults = {
   autoCore: true,
   autoPlugins: true,
   autoRemote: false,
+  parallelNodes: 1,
 };
 export class UpdateError extends Error {
   constructor(code) {
@@ -79,7 +80,9 @@ export function parseSettings(values, current = defaults) {
   if (
     Object.keys(values).some((k) => !Object.hasOwn(defaults, k)) ||
     Object.entries(next).some(([k, v]) =>
-      k === 'intervalMinutes' ? !Number.isInteger(v) || v < 15 || v > 1440 : typeof v !== 'boolean',
+      k === 'intervalMinutes' ? !Number.isInteger(v) || v < 15 || v > 1440
+        : k === 'parallelNodes' ? !Number.isInteger(v) || v < 1 || v > 3
+        : typeof v !== 'boolean',
     ) ||
     (next.autoInstall && !next.automaticCheck)
   )
@@ -333,6 +336,10 @@ export class Updater {
       if (!alive) {
         job.status = 'failed';
         job.error = 'interrupted';
+        for (const item of job.items || []) {
+          if (item.status === 'installing') { item.status = 'failed'; item.error = 'interrupted'; }
+          else if (item.status === 'pending') item.status = 'skipped';
+        }
         job.finishedAt = Date.now();
         await atomic(join(this.dir, 'job.json'), job);
       }
@@ -753,13 +760,20 @@ export class Updater {
           status: 'queued',
           items: items.map((i) => ({ ...i, status: 'pending' })),
           automatic,
+          parallelNodes: settings.parallelNodes,
           startedAt: Date.now(),
           updatedAt: Date.now(),
         };
       await atomic(join(this.dir, 'job.json'), job);
       const worker = join(this.dir, 'worker-' + id + '.mjs');
       await copyFile(fileURLToPath(import.meta.url), worker);
-      await this.launch(worker, id);
+      try { await this.launch(worker, id); }
+      catch(e) {
+        job.status='failed';job.error=errorCode(e);job.finishedAt=Date.now();
+        for(const item of job.items)item.status='skipped';
+        await atomic(join(this.dir,'job.json'),job);
+        throw e;
+      }
       return { accepted: true, jobId: id };
     } catch (e) {
       await unlink(join(this.dir, 'lock.json')).catch(() => {});
@@ -838,6 +852,7 @@ export class Updater {
     if (job?.id === id) {
       job.status = 'failed';
       job.error = 'independent_worker';
+      for(const item of job.items || [])if(['pending','installing'].includes(item.status))item.status='skipped';
       job.finishedAt = Date.now();
       job.updatedAt = Date.now();
       await atomic(join(this.dir, 'job.json'), job);
@@ -848,66 +863,96 @@ export class Updater {
     const job = await read(join(this.dir, 'job.json'), null);
     if (!job || job.id !== id || job.status !== 'queued') throw new UpdateError('invalid_job');
     await atomic(join(this.dir, 'lock.json'), { pid: process.pid, id });
-    const save = async () => {
+    // Serialize snapshots even when independent nodes are updated concurrently.
+    let tail = Promise.resolve();
+    const save = () => {
       job.updatedAt = Date.now();
-      await atomic(join(this.dir, 'job.json'), job);
+      const snapshot = structuredClone(job);
+      return tail = tail.then(() => atomic(join(this.dir, 'job.json'), snapshot));
     };
     job.status = 'running';
     await save();
-    try {
-      for (const item of job.items) {
-        item.status = 'installing';
-        await save();
+    const install = async (item) => {
+      item.status = 'installing';
+      await save();
+      try {
         if (item.nodeId) {
           const identity = await this.route(item, 'core.info');
           if (identity.node_id !== item.nodeId) throw new UpdateError('node_changed');
         }
         if (item.kind === 'core' && !item.local && item.nodeId)
-          await this.installRemoteCore(item, async (phase) => {
-            item.phase = phase;
-            await save();
-          });
+          await this.installRemoteCore(item, async (phase) => { item.phase = phase; await save(); });
         else if (item.kind === 'core')
-          await this.coreInstall(item, async (phase) => {
-            item.phase = phase;
-            await save();
-          });
+          await this.coreInstall(item, async (phase) => { item.phase = phase; await save(); });
         else {
           const before = await this.route(item, 'core.info');
           if (compareVersions(before.version, '0.3.4') < 0) throw new UpdateError('core_first');
           const j = await this.route(item, 'packages.install', {
-            id: item.id,
-            expectedVersion: item.latest,
-            expectedSha256: item.sha256,
+            id: item.id, expectedVersion: item.latest, expectedSha256: item.sha256,
           });
-          let result;
+          let complete = false;
           for (let i = 0; i < 600; i++) {
             await sleep(1000);
-            const jobs = await this.route(item, 'packages.jobs'),
-              current = jobs.find((x) => x.id === j.jobId);
+            const jobs = await this.route(item, 'packages.jobs');
+            const current = jobs.find((x) => x.id === j.jobId);
             if (current?.status === 'failed') throw new UpdateError('plugin_failed');
             if (current?.status === 'complete') {
-              result = current.result;
+              // Core returns {installed:[{installed: packageId, version}], warnings}.
+              // Keep compatibility with pre-dependency installer results.
+              const result = current.result;
+              const releases = Array.isArray(result?.installed) ? result.installed : [result];
+              if (!releases.some(r => r?.version === item.latest &&
+                (r.installed === item.id || (!Array.isArray(result?.installed) && !r.installed))))
+                throw new UpdateError('invalid_release');
+              complete = true;
               break;
             }
             if (i % 5 === 0) await save();
           }
-          if (result?.version !== item.latest) throw new UpdateError('plugin_timeout');
+          if (!complete) throw new UpdateError('plugin_timeout');
         }
         item.status = 'complete';
-        item.finishedAt = Date.now();
-        await save();
+      } catch (e) {
+        item.status = 'failed'; item.error = errorCode(e);
+        job.error ||= item.error;
       }
-      job.status = 'complete';
+      item.finishedAt = Date.now();
+      await save();
+      return item.status === 'complete';
+    };
+    try {
+      const groups = new Map();
+      const localWeb = job.items.filter(i => i.local && i.kind === 'web');
+      for (const item of job.items.filter(i => !localWeb.includes(i))) {
+        const key = item.nodeId || 'local';
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(item);
+      }
+      const queues = [...groups.values()];
+      let cursor = 0;
+      await Promise.all(Array.from({length: Math.min(job.parallelNodes || 1, queues.length)}, async () => {
+        while (cursor < queues.length) {
+          const items = queues[cursor++];
+          let failed = false;
+          for (const item of items) {
+            if (failed) { item.status = 'skipped'; item.finishedAt = Date.now(); await save(); }
+            else failed = !(await install(item));
+          }
+        }
+      }));
+      // Never restart the serving Web until all other selected work succeeded.
+      for (const item of localWeb) {
+        if (job.error) { item.status = 'skipped'; item.finishedAt = Date.now(); }
+        else await install(item);
+      }
+      job.status = job.error ? (job.error === 'rolled_back' ? 'rolled_back' : 'failed') : 'complete';
     } catch (e) {
-      job.status = e.code === 'rolled_back' ? 'rolled_back' : 'failed';
-      job.error = errorCode(e);
-      const current = job.items.find((i) => i.status === 'installing');
-      if (current) {
-        current.status = 'failed';
-        current.error = job.error;
-      }
+      job.status = 'failed'; job.error = errorCode(e);
     } finally {
+      for (const item of job.items) {
+        if (item.status === 'pending') item.status = 'skipped';
+        if (item.status === 'installing') { item.status = 'failed'; item.error = job.error; }
+      }
       job.finishedAt = Date.now();
       await save();
       await unlink(join(this.dir, 'lock.json')).catch(() => {});

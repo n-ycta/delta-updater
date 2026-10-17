@@ -43,3 +43,10 @@ Run `npm ci` and `npm test` in this repository. Direct `npm start` is for a deli
 
 
 Automated tests use isolated fixtures. Physical desktop restart, phone lifecycle, and production VPS acceptance are not implied by a passing test suite.
+
+## 0.1.1 reliability fixes
+
+- Validate nested Core dependency-install results by exact package identity/version.
+- Terminalize waiting items after failure or worker interruption.
+- Optional parallelNodes (1–3, default 1): different nodes overlap, each node stays serialized, serving Web always last.
+- Regression tests cover wrong releases, worker startup failures and actual cross-node overlap.

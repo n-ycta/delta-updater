@@ -76,7 +76,7 @@ async function fixture() {
       return { jobId: args.id };
     }
     if (cap === 'packages.jobs')
-      return entries.map((e) => ({ id: e.id, status: 'complete', result: { version: e.version } }));
+      return entries.map((e) => ({ id: e.id, status: 'complete', result: { installed: [{ installed: e.id, version: e.version }], warnings: [] } }));
     throw Error(cap);
   };
   for (const [id, version] of installed) {
@@ -200,7 +200,7 @@ test('plugin-only update on old core is blocked, and corrupt/unsafe archive or u
     await f.cleanup();
   }
 });
-test('failed component stops the sequence and leaves the Web update pending', async () => {
+test('failed component terminates remaining work as skipped, never waiting forever', async () => {
   const f = await fixture();
   try {
     const original = f.u.call;
@@ -212,7 +212,8 @@ test('failed component stops the sequence and leaves the Web update pending', as
     const q = (await f.u.status()).job;
     const result = await f.u.runJob(q.id);
     assert.equal(result.status, 'failed');
-    assert.equal(result.items.at(-1).status, 'pending');
+    assert.equal(result.items.at(-1).status, 'skipped');
+    assert(!result.items.some(i => ['pending', 'installing'].includes(i.status)));
     assert.equal(result.items[1].status, 'failed');
   } finally {
     await f.cleanup();
@@ -368,4 +369,31 @@ test('connected service root is discovered separately from the local profile; du
   } finally {
     await f.cleanup();
   }
+});
+
+test('parallel settings are bounded and opt-in', () => {
+  assert.equal(parseSettings({}).parallelNodes, 1);
+  assert.equal(parseSettings({parallelNodes:3}).parallelNodes, 3);
+  for (const parallelNodes of [0,4,1.5,true,'2']) assert.throws(() => parseSettings({parallelNodes}));
+});
+test('completed wrong package is a terminal invalid release, not a ten minute timeout',async()=>{
+ const f=await fixture();try{const call=f.u.call;f.u.call=async(cap,args,node)=>cap==='packages.jobs'?[{id:'dev.delta.db',status:'complete',result:{installed:[{installed:'another.package',version:'0.4.0'}]}}]:call(cap,args,node);
+ await f.u.apply();const q=(await f.u.status()).job;const r=await f.u.runJob(q.id);assert.equal(r.error,'invalid_release');assert(!r.items.some(i=>['pending','installing'].includes(i.status)));}finally{await f.cleanup()}
+});
+test('worker startup failure terminalizes every waiting item',async()=>{
+ const f=await fixture();try{f.u.launch=async()=>{throw new UpdateError('independent_worker')};await assert.rejects(f.u.apply());const q=(await f.u.status()).job;assert.equal(q.status,'failed');assert(q.items.every(i=>i.status==='skipped'));}finally{await f.cleanup()}
+});
+test('parallel nodes overlap while each node remains serial and local Web is last',async()=>{
+ const f=await fixture();try{
+  const events=[],active=new Set();let overlap=false;
+  f.u.route=async(item,cap,args)=>{
+   if(cap==='core.info')return{node_id:item.nodeId,version:'0.4.4'};
+   if(cap==='packages.install'){assert(!active.has(item.nodeId));active.add(item.nodeId);if(active.size>1)overlap=true;events.push('start:'+item.id);return{jobId:item.id}}
+   if(cap==='packages.jobs'){active.delete(item.nodeId);events.push('done:'+item.id);return[{id:item.id,status:'complete',result:{installed:[{installed:item.id,version:'1.0.0'}]}}]}
+   throw Error(cap);
+  };
+  const items=[['a','one'],['b','one'],['c','two'],['web','one']].map(([id,nodeId])=>({id,nodeId,local:nodeId==='one',kind:id==='web'?'web':'plugin',latest:'1.0.0',status:'pending'}));
+  await writeFile(join(f.u.dir,'job.json'),JSON.stringify({id:'parallel',status:'queued',items,parallelNodes:2,updatedAt:Date.now()}));
+  const r=await f.u.runJob('parallel');assert.equal(r.status,'complete');assert(overlap);assert(events.indexOf('done:a')<events.indexOf('start:b'));assert.equal(events.at(-2),'start:web');
+ }finally{await f.cleanup()}
 });
