@@ -1,3 +1,4 @@
+import { gzipSync } from 'node:zlib';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
@@ -396,4 +397,13 @@ test('parallel nodes overlap while each node remains serial and local Web is las
   await writeFile(join(f.u.dir,'job.json'),JSON.stringify({id:'parallel',status:'queued',items,parallelNodes:2,updatedAt:Date.now()}));
   const r=await f.u.runJob('parallel');assert.equal(r.status,'complete');assert(overlap);assert(events.indexOf('done:a')<events.indexOf('start:b'));assert.equal(events.at(-2),'start:web');
  }finally{await f.cleanup()}
+});
+
+function coreArchive(names) {
+ const parts=[];for(const name of names){const data=Buffer.from('fixture'),h=Buffer.alloc(512);h.write(name);h.write('0000644\0',100);h.write('0000000\0',108);h.write('0000000\0',116);h.write(data.length.toString(8).padStart(11,'0')+'\0',124);h.write('00000000000\0',136);h.fill(32,148,156);h[156]=48;h.write('ustar\0',257);let sum=0;for(const b of h)sum+=b;h.write(sum.toString(8).padStart(6,'0')+'\0 ',148);parts.push(h,data,Buffer.alloc(512-data.length));}return gzipSync(Buffer.concat([...parts,Buffer.alloc(1024)]));
+}
+test('official Core recovery helper is accepted without allowing arbitrary archive scripts',()=>{
+ const binary=process.platform==='win32'?'delta.exe':'delta';const files=unpackCore(coreArchive([binary,'recover-web.mjs']));assert.equal(files.get('recover-web.mjs').toString(),'fixture');
+ assert.throws(()=>unpackCore(coreArchive([binary,'unknown.mjs'])),e=>e.code==='invalid_archive');
+ assert.throws(()=>unpackCore(coreArchive([binary,'../recover-web.mjs'])),e=>e.code==='invalid_archive');
 });

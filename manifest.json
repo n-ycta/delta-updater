@@ -1,12 +1,12 @@
 {
   "id": "updater",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Headless updater service; no Web or graphical host required.",
   "metadata": {
     "ui": {
       "id": "dev.delta.updater",
       "name": "Delta Updater",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "contract": "^1.5.0",
       "description": "Headless updater service; no Web or graphical host required.",
       "publisher": "Delta",

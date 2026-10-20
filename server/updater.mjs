@@ -148,7 +148,7 @@ export function unpackCore(body) {
     if (!['0', '5', 'x', 'g'].includes(type)) throw new UpdateError('invalid_archive');
     if (type === '0') {
       if (
-        !['delta', 'delta.exe', 'bootstrap.mjs', 'upgrade.mjs', 'LICENSE', 'NOTICE'].includes(
+        !['delta', 'delta.exe', 'bootstrap.mjs', 'upgrade.mjs', 'recover-web.mjs', 'LICENSE', 'NOTICE'].includes(
           name,
         ) ||
         files.has(name)
@@ -1237,7 +1237,7 @@ export class Updater {
       await this.startCore(binary, service);
       await this.waitCore(latest, old.node_id);
       // Install bootstrap helpers only after health succeeds. Runtime, identity and plugin data are untouched.
-      for (const name of ['bootstrap.mjs', 'upgrade.mjs'])
+      for (const name of ['bootstrap.mjs', 'upgrade.mjs', 'recover-web.mjs'])
         if (files.has(name)) {
           const tmp = join(this.home, 'bin', name + '.next');
           await writeFile(tmp, files.get(name), { mode: 0o700 });
